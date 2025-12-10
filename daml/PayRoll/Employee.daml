@@ -1,0 +1,48 @@
+module PayRoll.Employee where
+
+template Employee
+  with
+    employer : Party
+    employeeId : Text
+    salary : Decimal
+  where
+    signatory employer
+
+    choice PaySalary : ContractId PaymentRequest
+      controller employer
+      do
+        currentTime <- getTime
+        create PaymentRequest with
+          employer
+          employeeId
+          amount = salary
+          requestTime = currentTime
+
+template PaymentRequest
+  with
+    employer : Party
+    employeeId : Text
+    amount : Decimal
+    requestTime : Time
+  where
+    signatory employer
+
+    choice ConfirmPayment : ContractId PaymentConfirmation
+      with
+        transactionHash : Text
+      controller employer
+      do
+        create PaymentConfirmation with
+          employer
+          employeeId
+          amount
+          transactionHash
+
+template PaymentConfirmation
+  with
+    employer : Party
+    employeeId : Text
+    amount : Decimal
+    transactionHash : Text
+  where
+    signatory employer

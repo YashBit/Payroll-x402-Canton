@@ -1,0 +1,11 @@
+sdk-version: 3.4.8
+name: payroll-poc
+version: 1.0.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+exposed-modules:
+  - PayRoll.Employee
+  - QuickTest

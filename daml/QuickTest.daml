@@ -1,0 +1,32 @@
+module QuickTest where
+
+import PayRoll.Employee
+import Daml.Script
+
+quickTest = script do
+  employer <- allocateParty "TestEmployer"
+  
+  -- Create employee with $5000 salary
+  empCid <- submit employer $ createCmd Employee with
+    employer
+    employeeId = "EMP001"
+    salary = 5000.0
+  
+  debug "✓ Employee created"
+  
+  -- Pay salary
+  payReqCid <- submit employer $ exerciseCmd empCid PaySalary
+  
+  debug "✓ Payment requested"
+  
+  -- Confirm payment
+  confirmCid <- submit employer $ exerciseCmd payReqCid ConfirmPayment with
+    transactionHash = "0xtest123abc"
+  
+  debug "✓ Payment confirmed"
+  
+  -- Query all confirmations
+  confirmations <- query @PaymentConfirmation employer
+  debug ("Total confirmations: " <> show (length confirmations))
+  
+  return ()
