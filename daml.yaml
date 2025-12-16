@@ -9,3 +9,4 @@ dependencies:
 exposed-modules:
   - PayRoll.Employee
   - QuickTest
+  - TriggerPayment

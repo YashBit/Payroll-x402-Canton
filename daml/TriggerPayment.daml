@@ -1,0 +1,27 @@
+module TriggerPayment where
+
+import PayRoll.Employee
+import Daml.Script
+import DA.Optional (fromSome)
+
+triggerPayment = script do
+  -- Use the existing party ID from your bridge
+  let employerText = "AcmePayroll::1220d19c5817f45ed90da1c93a7f6d5a20538458aeca7b15dfb9a7d9b30fb435a5b7"
+  let employerParty = fromSome (partyFromText employerText)
+  
+  debug "Using existing AcmePayroll party"
+  
+  -- Create employee with $1000 salary
+  empCid <- submit employerParty $ createCmd Employee with
+    employer = employerParty
+    employeeId = "EMP001"
+    salary = 1000.0
+  
+  debug "✓ Employee created"
+  
+  -- Pay salary (this creates PaymentRequest)
+  payReqCid <- submit employerParty $ exerciseCmd empCid PaySalary
+  
+  debug "✓ PaymentRequest created - Bridge should detect this!"
+  
+  return ()
