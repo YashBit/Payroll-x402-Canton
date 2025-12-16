@@ -1,0 +1,40 @@
+{
+  "name": "canton-x402-payroll-bridge",
+  "version": "1.0.0",
+  "description": "Bridge service connecting Canton Network smart contracts to x402 stablecoin payments",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "canton",
+    "x402",
+    "payroll",
+    "daml",
+    "blockchain",
+    "stablecoin"
+  ],
+  "author": "Yash Bharti",
+  "license": "ISC",
+  "dependencies": {
+    "@daml/ledger": "^2.8.0",
+    "@grpc/grpc-js": "^1.9.0",
+    "@grpc/proto-loader": "^0.7.15",
+    "@x402/core": "^2.0.0",
+    "@x402/evm": "^2.0.0",
+    "@x402/fetch": "^2.0.0",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^3.3.2",
+    "viem": "^2.42.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

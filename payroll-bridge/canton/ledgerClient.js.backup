@@ -1,0 +1,589 @@
+import grpc from '@grpc/grpc-js';
+import protoLoader from '@grpc/proto-loader';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import fetch from 'node-fetch';
+import logger from '../utils/logger.js';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Canton Ledger Client with OAuth2 Authentication
+ * Full gRPC integration with Keycloak OAuth2 token management
+ */
+class CantonLedgerClient {
+  constructor() {
+    this.host = process.env.CANTON_LEDGER_HOST || 'localhost';
+    this.port = process.env.CANTON_LEDGER_PORT || '2901';
+    this.partyId = process.env.CANTON_PARTY_ID;
+    
+    // OAuth2 configuration
+    this.tokenUrl = process.env.KEYCLOAK_TOKEN_URL;
+    this.clientId = process.env.KEYCLOAK_CLIENT_ID;
+    this.clientSecret = process.env.KEYCLOAK_CLIENT_SECRET;
+    this.audience = process.env.KEYCLOAK_AUDIENCE;
+    
+    if (!this.partyId) {
+      throw new Error('CANTON_PARTY_ID environment variable is required');
+    }
+    
+    if (!this.tokenUrl || !this.clientId || !this.clientSecret) {
+      throw new Error('OAuth2 configuration required: KEYCLOAK_TOKEN_URL, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET');
+    }
+
+    this.updateServiceClient = null;
+    this.commandServiceClient = null;
+    this.packageServiceClient = null;
+    this.stream = null;
+    this.packageId = null;
+    
+    // Token management
+    this.accessToken = null;
+    this.tokenExpiry = null;
+
+    logger.info(`Initializing Canton Ledger Client for ${this.host}:${this.port}`);
+    logger.info(`OAuth2 authentication enabled with ${this.tokenUrl}`);
+  }
+
+  /**
+   * Get OAuth2 access token from Keycloak
+   */
+  async getAccessToken() {
+    try {
+      // Check if token is still valid
+      if (this.accessToken && this.tokenExpiry && Date.now() < this.tokenExpiry - 30000) {
+        logger.debug('Using cached OAuth2 token');
+        return this.accessToken;
+      }
+
+      logger.info('🔐 Requesting new OAuth2 token from Keycloak...');
+
+      const response = await fetch(this.tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: new URLSearchParams({
+          client_id: this.clientId,
+          client_secret: this.clientSecret,
+          grant_type: 'client_credentials',
+          audience: this.audience
+        })
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`OAuth2 token request failed: ${response.status} - ${error}`);
+      }
+
+      const data = await response.json();
+      
+      if (!data.access_token) {
+        throw new Error('No access_token in OAuth2 response');
+      }
+
+      this.accessToken = data.access_token;
+      this.tokenExpiry = Date.now() + (data.expires_in * 1000); // expires_in is in seconds
+
+      logger.info(`✅ OAuth2 token obtained (expires in ${data.expires_in}s)`);
+      logger.debug(`Token preview: ${this.accessToken.substring(0, 50)}...`);
+
+      return this.accessToken;
+
+    } catch (error) {
+      logger.error('❌ Failed to get OAuth2 token', {
+        error: error.message,
+        tokenUrl: this.tokenUrl
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Create gRPC call credentials with OAuth2 token
+   */
+  createCallCredentialsSync(token) {
+    return grpc.credentials.createFromMetadataGenerator((params, callback) => {
+      const metadata = new grpc.Metadata();
+      metadata.add('authorization', `Bearer ${token}`);
+      callback(null, metadata);
+    });
+  }
+
+  /**
+   * Connect to Canton Ledger API and load proto definitions
+   */
+  async connect() {
+    try {
+      logger.info('Connecting to Canton Ledger API...');
+      
+      // Get OAuth2 token first
+      await this.getAccessToken();
+      
+      // Load proto definitions
+      await this.loadProtos();
+      
+      logger.info('✅ Canton Ledger connection established', { 
+        address: `${this.host}:${this.port}`,
+        party: this.partyId,
+        authenticated: true
+      });
+      
+      return true;
+      
+    } catch (error) {
+      logger.error('Failed to connect to Canton', { 
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Load Canton proto definitions and create gRPC clients with auth
+   */
+  async loadProtos() {
+    try {
+      logger.info('Loading Canton proto definitions...');
+
+      const protoPath = path.resolve(__dirname, '../proto');
+      logger.debug(`Proto base path: ${protoPath}`);
+
+      if (!fs.existsSync(protoPath)) {
+        throw new Error(`Proto directory not found: ${protoPath}`);
+      }
+
+      const updateServiceProtoPath = path.join(protoPath, 'com/daml/ledger/api/v2/update_service.proto');
+      logger.debug(`Looking for proto file: ${updateServiceProtoPath}`);
+      
+      if (!fs.existsSync(updateServiceProtoPath)) {
+        throw new Error(
+          `Proto files missing!\n\n` +
+          `Expected: ${updateServiceProtoPath}\n\n` +
+          `Run: cp -r ~/Desktop/Engineering/core_projects/canton/cn-quickstart/quickstart/backend/build/extracted-protos/main/* proto/\n`
+        );
+      }
+
+      const address = `${this.host}:${this.port}`;
+
+      // Get token first (already have it from connect())
+      await this.getAccessToken();
+
+      // For localhost, use insecure credentials
+      // We'll add the OAuth2 token as metadata on each call
+      const credentials = grpc.credentials.createInsecure();
+
+      // Proto loader options
+      const options = {
+        keepCase: true,
+        longs: String,
+        enums: String,
+        defaults: true,
+        oneofs: true,
+        includeDirs: [protoPath]
+      };
+
+      // Load UpdateService proto
+      logger.debug('Loading UpdateService proto...');
+      const updateServiceProto = protoLoader.loadSync(
+        'com/daml/ledger/api/v2/update_service.proto',
+        options
+      );
+      
+      const updateServiceDef = grpc.loadPackageDefinition(updateServiceProto);
+      this.updateServiceClient = new updateServiceDef.com.daml.ledger.api.v2.UpdateService(
+        address,
+        credentials
+      );
+      logger.debug('✅ UpdateService client created (with OAuth2 metadata)');
+
+      // Load CommandService proto
+      logger.debug('Loading CommandService proto...');
+      const commandServiceProto = protoLoader.loadSync(
+        'com/daml/ledger/api/v2/command_service.proto',
+        options
+      );
+      const commandServiceDef = grpc.loadPackageDefinition(commandServiceProto);
+      this.commandServiceClient = new commandServiceDef.com.daml.ledger.api.v2.CommandService(
+        address,
+        credentials
+      );
+      logger.debug('✅ CommandService client created (with OAuth2 metadata)');
+
+      // Load PackageService proto
+      logger.debug('Loading PackageService proto...');
+      const packageServiceProto = protoLoader.loadSync(
+        'com/daml/ledger/api/v2/package_service.proto',
+        options
+      );
+      const packageServiceDef = grpc.loadPackageDefinition(packageServiceProto);
+      this.packageServiceClient = new packageServiceDef.com.daml.ledger.api.v2.PackageService(
+        address,
+        credentials
+      );
+      logger.debug('✅ PackageService client created (with OAuth2 metadata)');
+
+      logger.info('✅ Proto definitions loaded successfully with OAuth2 authentication');
+
+      // Discover package ID
+      await this.discoverPackageId();
+
+    } catch (error) {
+      logger.error('Failed to load protos', { 
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Discover the package ID for PayRoll templates
+   */
+  async discoverPackageId() {
+    try {
+      logger.info('Discovering PayRoll package ID...');
+
+      return new Promise((resolve, reject) => {
+        this.packageServiceClient.listPackages({}, (error, response) => {
+          if (error) {
+            logger.warn(`Could not list packages: ${error.message}`);
+            resolve();
+            return;
+          }
+
+          const packages = response.package_ids || [];
+          logger.debug(`Found ${packages.length} packages on ledger`);
+          logger.info('Package discovery will happen from first event');
+          resolve();
+        });
+      });
+
+    } catch (error) {
+      logger.warn(`Package discovery failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * Subscribe to PaymentRequest creation events using real gRPC stream
+   */
+  async subscribeToPaymentRequests(callback) {
+    try {
+      logger.info('🔄 Subscribing to PaymentRequest events (REAL gRPC stream with OAuth2)...');
+
+      // Build filter - receive all events for this party
+      const filter = {
+        filters_by_party: {}
+      };
+
+      filter.filters_by_party[this.partyId] = {
+        cumulative: {}  // Receive all events
+      };
+
+      const request = {
+        begin_bookmark: '',
+        end_bookmark: '',
+        filter: filter,
+        verbose: true,
+        update_format: {
+          transaction_format: {
+            event_format: {
+              created_event_blob: false
+            }
+          }
+        }
+      };
+
+      logger.debug(`Subscribing with party: ${this.partyId}`);
+
+      // Create stream with metadata
+      const metadata = new grpc.Metadata();
+      metadata.add('authorization', `Bearer ${this.accessToken}`);
+
+      this.stream = this.updateServiceClient.getUpdates(request, metadata);
+
+      // Handle stream events
+      this.stream.on('data', (update) => {
+        try {
+          logger.debug('Received update from Canton');
+          const event = this.parseUpdate(update);
+          if (event) {
+            logger.info('🎉 PaymentRequest detected!', {
+              contractId: event.contractId,
+              employeeId: event.employeeId,
+              amount: event.amount
+            });
+            callback(event);
+          }
+        } catch (error) {
+          logger.error(`Error parsing update: ${error.message}`);
+        }
+      });
+
+      this.stream.on('error', async (error) => {
+        logger.error('Stream error occurred', { 
+          message: error.message,
+          code: error.code
+        });
+        
+        // Check if it's an auth error
+        if (error.code === 16 || error.code === 'UNAUTHENTICATED') {
+          logger.warn('🔐 Authentication error - token may have expired');
+          logger.info('Refreshing OAuth2 token and reconnecting...');
+          
+          // Clear token to force refresh
+          this.accessToken = null;
+          
+          // Reconnect with new token
+          setTimeout(async () => {
+            try {
+              await this.getAccessToken();
+              await this.subscribeToPaymentRequests(callback);
+            } catch (err) {
+              logger.error(`Reconnection failed: ${err.message}`);
+            }
+          }, 2000);
+        } else {
+          // Other errors - standard reconnection
+          setTimeout(() => {
+            logger.info('Attempting to reconnect stream...');
+            this.subscribeToPaymentRequests(callback).catch(err => {
+              logger.error(`Reconnection failed: ${err.message}`);
+            });
+          }, 5000);
+        }
+      });
+
+      this.stream.on('end', () => {
+        logger.warn('Stream ended unexpectedly');
+        setTimeout(() => {
+          logger.info('Attempting to reconnect stream after end...');
+          this.subscribeToPaymentRequests(callback).catch(err => {
+            logger.error(`Reconnection failed: ${err.message}`);
+          });
+        }, 5000);
+      });
+
+      logger.info('✅ Real-time gRPC event stream active (authenticated)');
+
+      return {
+        cancel: () => {
+          if (this.stream) {
+            this.stream.cancel();
+            logger.info('Event stream cancelled');
+          }
+        }
+      };
+
+    } catch (error) {
+      logger.error('Failed to subscribe to transactions', { 
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Parse update from Canton stream
+   */
+  parseUpdate(update) {
+    try {
+      if (!update.update || !update.update.transaction) {
+        return null;
+      }
+
+      const transaction = update.update.transaction;
+      
+      for (const event of transaction.events || []) {
+        if (event.created) {
+          return this.parseCreatedEvent(event.created);
+        }
+      }
+
+      return null;
+
+    } catch (error) {
+      logger.error(`Failed to parse update: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Parse created event into PaymentRequest
+   */
+  parseCreatedEvent(created) {
+    try {
+      const templateId = created.template_id;
+
+      if (!templateId || 
+          templateId.module_name !== 'PayRoll.Employee' || 
+          templateId.entity_name !== 'PaymentRequest') {
+        return null;
+      }
+
+      if (templateId.package_id && !this.packageId) {
+        this.packageId = templateId.package_id;
+        logger.info(`✅ Discovered package ID: ${this.packageId}`);
+      }
+
+      const args = this.parseRecord(created.create_arguments);
+      
+      return {
+        contractId: created.contract_id,
+        packageId: templateId.package_id,
+        employer: args.employer,
+        employeeId: args.employeeId,
+        amount: parseFloat(args.amount),
+        requestTime: args.requestTime
+      };
+
+    } catch (error) {
+      logger.error(`Failed to parse created event: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Parse Daml Record structure from proto
+   */
+  parseRecord(record) {
+    const result = {};
+
+    if (!record || !record.fields) {
+      return result;
+    }
+
+    for (const field of record.fields) {
+      const label = field.label;
+      const value = this.parseValue(field.value);
+      result[label] = value;
+    }
+
+    return result;
+  }
+
+  /**
+   * Parse Daml Value from proto
+   */
+  parseValue(value) {
+    if (!value) return null;
+
+    if (value.party) return value.party;
+    if (value.text) return value.text;
+    if (value.int64) return value.int64;
+    if (value.numeric) return value.numeric;
+    if (value.bool) return value.bool;
+    if (value.timestamp) return value.timestamp;
+    if (value.record) return this.parseRecord(value.record);
+    if (value.list) return value.list.elements.map(e => this.parseValue(e));
+
+    return null;
+  }
+
+  /**
+   * Exercise ConfirmPayment choice on PaymentRequest contract
+   * REAL implementation using CommandService with OAuth2
+   */
+  async confirmPayment(contractId, transactionHash, packageId) {
+    try {
+      logger.info('📝 Confirming payment on Canton (REAL gRPC with OAuth2)', { 
+        contractId, 
+        transactionHash 
+      });
+
+      const pkgId = packageId || this.packageId;
+      
+      if (!pkgId) {
+        throw new Error('Package ID not available - cannot submit command');
+      }
+
+      // Ensure token is fresh
+      await this.getAccessToken();
+
+      const command = {
+        commands: [
+          {
+            exercise: {
+              template_id: {
+                package_id: pkgId,
+                module_name: 'PayRoll.Employee',
+                entity_name: 'PaymentRequest'
+              },
+              contract_id: contractId,
+              choice: 'ConfirmPayment',
+              choice_argument: {
+                record: {
+                  fields: [
+                    {
+                      label: 'transactionHash',
+                      value: {
+                        text: transactionHash
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        workflow_id: `payroll-${Date.now()}`,
+        application_id: 'payroll-bridge',
+        command_id: `cmd-${Date.now()}`,
+        act_as: [this.partyId],
+        submission_id: `sub-${Date.now()}`
+      };
+
+      logger.debug('Submitting command to Canton...');
+
+      // Create metadata with current token
+      const metadata = new grpc.Metadata();
+      metadata.add('authorization', `Bearer ${this.accessToken}`);
+
+      const response = await new Promise((resolve, reject) => {
+        this.commandServiceClient.submitAndWait(command, metadata, (error, response) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(response);
+          }
+        });
+      });
+
+      logger.info('✅ Payment confirmed on Canton', { 
+        transactionId: response.completion?.transaction_id 
+      });
+
+      return {
+        confirmationContractId: response.completion?.transaction_id || 'confirmed',
+        success: true
+      };
+
+    } catch (error) {
+      logger.error('❌ Failed to confirm payment', { 
+        contractId,
+        error: error.message,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Disconnect from Canton
+   */
+  async disconnect() {
+    if (this.stream) {
+      this.stream.cancel();
+    }
+    logger.info('Disconnected from Canton');
+  }
+}
+
+export default CantonLedgerClient;
