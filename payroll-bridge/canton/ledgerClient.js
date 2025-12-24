@@ -50,12 +50,8 @@ class CantonLedgerClient {
     logger.info(`OAuth2 authentication enabled with ${this.tokenUrl}`);
   }
 
-  /**
-   * Get OAuth2 access token from Keycloak
-   */
   async getAccessToken() {
     try {
-      // Check if token is still valid
       if (this.accessToken && this.tokenExpiry && Date.now() < this.tokenExpiry - 30000) {
         logger.debug('Using cached OAuth2 token');
         return this.accessToken;
@@ -88,10 +84,9 @@ class CantonLedgerClient {
       }
 
       this.accessToken = data.access_token;
-      this.tokenExpiry = Date.now() + (data.expires_in * 1000); // expires_in is in seconds
+      this.tokenExpiry = Date.now() + (data.expires_in * 1000);
 
       logger.info(`✅ OAuth2 token obtained (expires in ${data.expires_in}s)`);
-      logger.debug(`Token preview: ${this.accessToken.substring(0, 50)}...`);
 
       return this.accessToken;
 
@@ -104,28 +99,11 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Create gRPC call credentials with OAuth2 token
-   */
-  createCallCredentialsSync(token) {
-    return grpc.credentials.createFromMetadataGenerator((params, callback) => {
-      const metadata = new grpc.Metadata();
-      metadata.add('authorization', `Bearer ${token}`);
-      callback(null, metadata);
-    });
-  }
-
-  /**
-   * Connect to Canton Ledger API and load proto definitions
-   */
   async connect() {
     try {
       logger.info('Connecting to Canton Ledger API...');
       
-      // Get OAuth2 token first
       await this.getAccessToken();
-      
-      // Load proto definitions
       await this.loadProtos();
       
       logger.info('✅ Canton Ledger connection established', { 
@@ -145,41 +123,21 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Load Canton proto definitions and create gRPC clients with auth
-   */
   async loadProtos() {
     try {
       logger.info('Loading Canton proto definitions...');
 
       const protoPath = path.resolve(__dirname, '../proto');
-      logger.debug(`Proto base path: ${protoPath}`);
-
+      
       if (!fs.existsSync(protoPath)) {
         throw new Error(`Proto directory not found: ${protoPath}`);
       }
 
-      const updateServiceProtoPath = path.join(protoPath, 'com/daml/ledger/api/v2/update_service.proto');
-      logger.debug(`Looking for proto file: ${updateServiceProtoPath}`);
-      
-      if (!fs.existsSync(updateServiceProtoPath)) {
-        throw new Error(
-          `Proto files missing!\n\n` +
-          `Expected: ${updateServiceProtoPath}\n\n` +
-          `Run: cp -r ~/Desktop/Engineering/core_projects/canton/cn-quickstart/quickstart/backend/build/extracted-protos/main/* proto/\n`
-        );
-      }
-
       const address = `${this.host}:${this.port}`;
-
-      // Get token first (already have it from connect())
       await this.getAccessToken();
 
-      // For localhost, use insecure credentials
-      // We'll add the OAuth2 token as metadata on each call
       const credentials = grpc.credentials.createInsecure();
 
-      // Proto loader options
       const options = {
         keepCase: true,
         longs: String,
@@ -189,8 +147,6 @@ class CantonLedgerClient {
         includeDirs: [protoPath]
       };
 
-      // Load UpdateService proto
-      logger.debug('Loading UpdateService proto...');
       const updateServiceProto = protoLoader.loadSync(
         'com/daml/ledger/api/v2/update_service.proto',
         options
@@ -201,10 +157,7 @@ class CantonLedgerClient {
         address,
         credentials
       );
-      logger.debug('✅ UpdateService client created (with OAuth2 metadata)');
 
-      // Load CommandService proto
-      logger.debug('Loading CommandService proto...');
       const commandServiceProto = protoLoader.loadSync(
         'com/daml/ledger/api/v2/command_service.proto',
         options
@@ -214,10 +167,7 @@ class CantonLedgerClient {
         address,
         credentials
       );
-      logger.debug('✅ CommandService client created (with OAuth2 metadata)');
 
-      // Load PackageService proto
-      logger.debug('Loading PackageService proto...');
       const packageServiceProto = protoLoader.loadSync(
         'com/daml/ledger/api/v2/package_service.proto',
         options
@@ -227,11 +177,9 @@ class CantonLedgerClient {
         address,
         credentials
       );
-      logger.debug('✅ PackageService client created (with OAuth2 metadata)');
 
       logger.info('✅ Proto definitions loaded successfully with OAuth2 authentication');
 
-      // Discover package ID
       await this.discoverPackageId();
 
     } catch (error) {
@@ -243,9 +191,6 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Discover the package ID for PayRoll templates
-   */
   async discoverPackageId() {
     try {
       logger.info('Discovering PayRoll package ID...');
@@ -270,27 +215,20 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Subscribe to PaymentRequest creation events using real gRPC stream
-   */
   async subscribeToPaymentRequests(callback) {
     try {
       logger.info('🔄 Subscribing to PaymentRequest events (REAL gRPC stream with OAuth2)...');
-
-      // Build filter - receive all events for this party
-      const filter = {
-        filters_by_party: {}
-      };
-
-      filter.filters_by_party = {}; // Listen for ALL parties
-  filter.filters_for_any_party = {
-        cumulative: {}  // Receive all events
-      };
+      logger.debug(`Subscribing for party: ${this.partyId}`);
 
       const request = {
         begin_bookmark: '',
-        end_bookmark: '',
-        filter: filter,
+        filter: {
+          filters_by_party: {
+            [this.partyId]: {
+              inclusive: {}
+            }
+          }
+        },
         verbose: true,
         update_format: {
           transaction_format: {
@@ -301,18 +239,23 @@ class CantonLedgerClient {
         }
       };
 
-      logger.debug(`Subscribing with party: ${this.partyId}`);
+      logger.debug(`Filter configured for party: ${this.partyId}`);
 
-      // Create stream with metadata
       const metadata = new grpc.Metadata();
       metadata.add('authorization', `Bearer ${this.accessToken}`);
 
       this.stream = this.updateServiceClient.getUpdates(request, metadata);
 
-      // Handle stream events
       this.stream.on('data', (update) => {
         try {
-          logger.debug('Received update from Canton');
+          // Skip offset checkpoints
+          if (update.update === 'offset_checkpoint') {
+            return;
+          }
+
+          // Log non-checkpoint updates
+          logger.info('📨 Received transaction update');
+
           const event = this.parseUpdate(update);
           if (event) {
             logger.info('🎉 PaymentRequest detected!', {
@@ -328,20 +271,13 @@ class CantonLedgerClient {
       });
 
       this.stream.on('error', async (error) => {
-        logger.error('Stream error occurred', { 
-          message: error.message,
-          code: error.code
-        });
+        logger.error(`Stream error: ${error.code} ${error.message}`);
         
-        // Check if it's an auth error
         if (error.code === 16 || error.code === 'UNAUTHENTICATED') {
-          logger.warn('🔐 Authentication error - token may have expired');
-          logger.info('Refreshing OAuth2 token and reconnecting...');
+          logger.warn('🔐 Authentication error - refreshing token...');
           
-          // Clear token to force refresh
           this.accessToken = null;
           
-          // Reconnect with new token
           setTimeout(async () => {
             try {
               await this.getAccessToken();
@@ -351,7 +287,7 @@ class CantonLedgerClient {
             }
           }, 2000);
         } else {
-          // Other errors - standard reconnection
+          logger.warn('Stream error - attempting reconnect...');
           setTimeout(() => {
             logger.info('Attempting to reconnect stream...');
             this.subscribeToPaymentRequests(callback).catch(err => {
@@ -362,7 +298,7 @@ class CantonLedgerClient {
       });
 
       this.stream.on('end', () => {
-        logger.warn('Stream ended unexpectedly');
+        logger.info('Stream ended - reconnecting...');
         setTimeout(() => {
           logger.info('Attempting to reconnect stream after end...');
           this.subscribeToPaymentRequests(callback).catch(err => {
@@ -391,18 +327,20 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Parse update from Canton stream
-   */
   parseUpdate(update) {
     try {
-      if (!update.update || !update.update.transaction) {
+      // Canton v2 API structure: update.transaction
+      if (!update || !update.transaction) {
         return null;
       }
 
-      const transaction = update.update.transaction;
+      const transaction = update.transaction;
       
-      for (const event of transaction.events || []) {
+      if (!transaction.events || transaction.events.length === 0) {
+        return null;
+      }
+      
+      for (const event of transaction.events) {
         if (event.created) {
           return this.parseCreatedEvent(event.created);
         }
@@ -416,9 +354,6 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Parse created event into PaymentRequest
-   */
   parseCreatedEvent(created) {
     try {
       const templateId = created.template_id;
@@ -451,9 +386,6 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Parse Daml Record structure from proto
-   */
   parseRecord(record) {
     const result = {};
 
@@ -470,9 +402,6 @@ class CantonLedgerClient {
     return result;
   }
 
-  /**
-   * Parse Daml Value from proto
-   */
   parseValue(value) {
     if (!value) return null;
 
@@ -488,10 +417,6 @@ class CantonLedgerClient {
     return null;
   }
 
-  /**
-   * Exercise ConfirmPayment choice on PaymentRequest contract
-   * REAL implementation using CommandService with OAuth2
-   */
   async confirmPayment(contractId, transactionHash, packageId) {
     try {
       logger.info('📝 Confirming payment on Canton (REAL gRPC with OAuth2)', { 
@@ -505,7 +430,6 @@ class CantonLedgerClient {
         throw new Error('Package ID not available - cannot submit command');
       }
 
-      // Ensure token is fresh
       await this.getAccessToken();
 
       const command = {
@@ -541,9 +465,6 @@ class CantonLedgerClient {
         submission_id: `sub-${Date.now()}`
       };
 
-      logger.debug('Submitting command to Canton...');
-
-      // Create metadata with current token
       const metadata = new grpc.Metadata();
       metadata.add('authorization', `Bearer ${this.accessToken}`);
 
@@ -576,9 +497,6 @@ class CantonLedgerClient {
     }
   }
 
-  /**
-   * Disconnect from Canton
-   */
   async disconnect() {
     if (this.stream) {
       this.stream.cancel();
